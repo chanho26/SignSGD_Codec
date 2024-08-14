@@ -6,7 +6,6 @@ The list of released papers related to this project is as follows:
 * SignSGD with federated voting ([arXiv](https://arxiv.org/abs/2403.16372), ISIT paper (to be appeared))
 * SignSGD with federated defense: Harnessing adversarial attacks through gradient sign decoding ([ICML paper](https://proceedings.mlr.press/v235/park24h.html))
 
-***
 ## How to implement
 
 ### Libraries (with current version)
