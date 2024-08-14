@@ -8,7 +8,7 @@ The list of released papers related to this project is as follows:
 
 ## How to implement
 
-### Libraries (with current version)
+### Libraries (with version when uploading code)
 * torch: 2.4.0
 * numpy: 1.26.4
 * matplotlib: 3.8.4 (if you want to plot)
