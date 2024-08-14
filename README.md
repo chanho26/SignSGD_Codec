@@ -10,10 +10,10 @@ The list of released papers related to this project is as follows:
 ## How to implement
 
 ### Libraries (with current version)
-torch: 2.4.0
-numpy: 1.26.4
-matplotlib: 3.8.4
-copy
+* torch: 2.4.0
+* numpy: 1.26.4
+* matplotlib: 3.8.4 (if you want to plot)
+* copy
 
 ### Usage
 Type the code below:
@@ -21,6 +21,7 @@ Type the code below:
 python main.py --[option] [input]
 ```
 If you want to implement this code with basic option, you just type only `python main.py`.
+
 If you want to change the options (e.g., dataset, number of workers, and hyper-parameters), please type `python main.py --help` and check all the options of our code.
 
 
