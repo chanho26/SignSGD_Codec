@@ -24,7 +24,7 @@ If you want to implement this code with basic option, you just type only `python
 If you want to change the options (e.g., dataset, number of workers, and hyper-parameters), please type `python main.py --help` and check all the options of our code.
 
 If you want to run each algorithm in the above papers, you can apply the following options:
-* [Data heterogeneity] Sparse-SignSGD with majority voting ($`\mathsf{S}^3`$GD-MV): `python main.py --sparsity 0.1`
-* [System heterogeneity] SignSGD with federated voting (SignSGD-FV): `python main.py --learning_method FV`
-* [Attack-resilience] SignSGD with federated defense (SignSGD-FD): `python main.py --learning_method FD`
-* [Baseline] SignSGD with majority voting (SignSGD-MV): `python main.py --learning_method MV`
+* **[Data heterogeneity]** Sparse-SignSGD with majority voting ($`\mathsf{S}^3`$GD-MV): `python main.py --sparsity 0.1`
+* **[System heterogeneity]** SignSGD with federated voting (SignSGD-FV): `python main.py --learning_method FV`
+* **[Attack-resilience]** SignSGD with federated defense (SignSGD-FD): `python main.py --learning_method FD`
+* **[Baseline]** SignSGD with majority voting (SignSGD-MV): `python main.py --learning_method MV`
