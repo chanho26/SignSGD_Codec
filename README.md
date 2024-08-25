@@ -3,7 +3,7 @@ This project contains research on algorithms that have improved signSGD with maj
 
 The list of released papers related to this project is as follows:
 * **[Data heterogeneity]** Sparse-SignSGD with majority vote for communication-efficient distributed learning ([arXiv](https://arxiv.org/abs/2302.07475), [ISIT paper](https://ieeexplore.ieee.org/abstract/document/10206480))
-* **[System heterogeneity]** SignSGD with federated voting ([arXiv](https://arxiv.org/abs/2403.16372), ISIT paper (to be appeared))
+* **[System heterogeneity]** SignSGD with federated voting ([arXiv](https://arxiv.org/abs/2403.16372), [ISIT paper](https://ieeexplore.ieee.org/abstract/document/10619155))
 * **[Attack-resilience]** SignSGD with federated defense: Harnessing adversarial attacks through gradient sign decoding ([ICML paper](https://proceedings.mlr.press/v235/park24h.html))
 
 ## How to implement
