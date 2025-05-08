@@ -32,91 +32,105 @@ parser.add_argument('--sparsity', type=float, default='1', help='Sparsity level'
 parser.add_argument('--spar_method', type=str, default='top', choices=['top', 'rand'], help='Sparsification method')
 parser.add_argument('--accum_weight', type=float, default='1', help='Error accumulation factor')
 parser.add_argument('--attack_prob', type=float, default='1', help='Stochastic sign flip probability')
+parser.add_argument('--avg_batch_size', type=int, default=64)
+parser.add_argument('--small_batch_size', type=int, default=4)
 
 args = parser.parse_args()
 
+# (Setting) Number of attacked workers
 attacked_workers = args.attacked_workers
 
 if args.attacked_workers == 0:
     args.attacked_workers = np.array([])
+
 elif args.attacked_workers == 1:
-    # assert(args.train_batch_size == 1)
     args.attacked_workers = np.array([0, 1, 2])
+
 elif args.attacked_workers == 2:
-    # assert(args.train_batch_size == 1)
     args.attacked_workers = np.array([0, 1, 2, 3, 4, 5])
+
 elif args.attacked_workers == 3:
-    # assert(args.train_batch_size == 1)
     args.attacked_workers = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8])
 
 # Customize
 elif args.attacked_workers == 4:
-    # assert(args.train_batch_size == 1)
     args.attacked_workers = np.array([0, 1])
-    # args.attacked_workers = np.array([0, 1, 2, 3, 4, 5, 6, 7])
-    # args.attacked_workers = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
 else:
     raise NotImplementedError('Invalid input argument: attacked_workers')
 
 
+# (Setting) Batch mode
 train_batch_size = args.train_batch_size
 batch = np.ones(args.num_workers, dtype=int)
-# assert(args.num_workers == 10)
+
 # batch mode 1
 if args.train_batch_size == 1:
-    args.train_batch_size = batch * 64
+    num_large = args.num_workers
 
 # batch mode 2
 elif args.train_batch_size == 2:
-    for i in range(len(batch)):
-        if i >= len(batch) * 3 / 5:
-            batch[i] = 154
-        else:
-            batch[i] = 4
-    args.train_batch_size = batch
+    num_large = int(len(batch) * 1 / 2)
 
 # batch mode 3
 elif args.train_batch_size == 3:
-    for i in range(len(batch)):
-        if i >= 4 * len(batch) / 5:
-            batch[i] = 304
-        else:
-            batch[i] = 4
-    args.train_batch_size = batch
+    num_large = int(len(batch) / 5)
 
 # batch mode 4
 elif args.train_batch_size == 4:
-    batch = batch * 4
-    batch[0] = args.num_workers * 60 + 4
-    args.train_batch_size = batch
+    num_large = 1 
 
 else:
     raise NotImplementedError('Invalid input argument: train_batch_size')
 
+avg_batch_size = args.avg_batch_size
+small_batch_size = args.small_batch_size
+
+for i in range(len(batch)):
+    if i < num_large:
+        batch[i] = int((avg_batch_size * args.num_workers - small_batch_size * (args.num_workers - num_large)) / num_large)
+    else:
+        batch[i] = small_batch_size
+
+args.train_batch_size = batch
+
+print('Batch size: ', batch)
+
+
+
 
 if args.sparsity == 1:
     if args.learning_method == 'FD':
-        accuracy, test_loss = signSGD_FD(args)  
+        accuracy, test_loss = signSGD_FD(args, train_batch_size) 
+
     elif args.learning_method == 'SGD':
         accuracy, test_loss = DSGD(args)
+
     elif args.learning_method == 'FV' or 'MV':
         accuracy, test_loss = signSGD_FV(args, train_batch_size)
+
     else:
         raise NotImplementedError('Invalid input argument: learning_method')
+    
 else:
     if args.learning_method == 'TopK':
         accuracy, test_loss = DSGD(args)
+
     elif args.learning_method == 'FD' or 'FV' or 'MV':
         accuracy, test_loss = S3GD_FV(args)
+
     else:
         raise NotImplementedError('Invalid input argument: learning_method')
 
 
-results = {'args': args,
-           'acc': accuracy,
-           'loss': test_loss,
-           }
+######################################### DSGD, S3GD_FV 수정 필요 #########################################
 
-# Save results
-torch.save(results, os.getcwd()+'/Results/num_workers_'+str(args.num_workers)
-           +'/train_batch_size_'+str(train_batch_size)+'/'+args.dataset+'_'+args.learning_method+'.pth')
+# results = {'args': args,
+#            'acc': accuracy,
+#            'train_loss': train_loss,
+#            'test_loss': test_loss
+#            }
+
+# # Save results
+# torch.save(results, os.getcwd()+'/Results/num_workers_'+str(args.num_workers)
+#            +'/train_batch_size_'+str(train_batch_size)+'/'+args.dataset+'_'+args.learning_method+'.pth')
