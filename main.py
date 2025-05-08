@@ -104,7 +104,7 @@ if args.sparsity == 1:
         accuracy, test_loss = signSGD_FD(args, train_batch_size) 
 
     elif args.learning_method == 'SGD':
-        accuracy, test_loss = DSGD(args)
+        accuracy, test_loss = DSGD(args, train_batch_size)
 
     elif args.learning_method == 'FV' or 'MV':
         accuracy, test_loss = signSGD_FV(args, train_batch_size)
@@ -114,23 +114,10 @@ if args.sparsity == 1:
     
 else:
     if args.learning_method == 'TopK':
-        accuracy, test_loss = DSGD(args)
+        accuracy, test_loss = DSGD(args, train_batch_size)
 
     elif args.learning_method == 'FD' or 'FV' or 'MV':
-        accuracy, test_loss = S3GD_FV(args)
+        accuracy, test_loss = S3GD_FV(args, train_batch_size)
 
     else:
         raise NotImplementedError('Invalid input argument: learning_method')
-
-
-######################################### DSGD, S3GD_FV 수정 필요 #########################################
-
-# results = {'args': args,
-#            'acc': accuracy,
-#            'train_loss': train_loss,
-#            'test_loss': test_loss
-#            }
-
-# # Save results
-# torch.save(results, os.getcwd()+'/Results/num_workers_'+str(args.num_workers)
-#            +'/train_batch_size_'+str(train_batch_size)+'/'+args.dataset+'_'+args.learning_method+'.pth')
