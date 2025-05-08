@@ -90,7 +90,7 @@ def initial(args, device, vocab=None):
         torch.cuda.synchronize()
 
 
-    if args.learning_method == 'FV':
+    if args.learning_method == 'FD':
         count_error = []
         for _, v in enumerate(global_model.parameters()):
             shape_weight = v.shape + (args.num_workers,)
@@ -183,26 +183,39 @@ def train_global(args, global_model, global_opt, stack_grad, r, count_error, dev
             # Distributed SGD
             # v.grad = (torch.sum(stack_grad[i_v], dim=-1) / args.num_workers).detach()
 
-        elif args.learning_method == 'FV':
-            if r < args.T_in:
-                v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+        elif args.learning_method == 'FD':
+            if r == 0:
+                wt = torch.ones_like(count_error[i_v])
+
+            elif r < args.T_in:
+                total_comp = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
+
+                if i_v == 0:
+                    total_error = torch.zeros(args.num_workers)
+                    for i in range(args.num_workers):
+                        for j in range(len(count_error)):
+                            total_error[i] += torch.sum(count_error[j][..., i])
+
+                wt = torch.log(total_error / (total_comp * r - total_error))
+                wt = torch.sign(wt) * torch.minimum(torch.abs(wt), args.num_workers * torch.ones_like(wt))
 
             else:
                 wt = torch.log(count_error[i_v] / (r - count_error[i_v]))
                 wt = torch.sign(wt) * torch.minimum(torch.abs(wt), args.num_workers * torch.ones_like(wt))
 
-                if (args.dataset == '20Newsgroups' or args.dataset == 'AGNews') and (i_v == 0):
-                    # Weights are not applied to the embedding layers
-                        v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+
+            if (args.dataset == '20Newsgroups' or args.dataset == 'AGNews') and (i_v == 0):
+                # Weights are not applied to the embedding layers
+                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+
+            else:
+                # Weights are not applied to the last layer
+                if (i_v == len(count_error)-1) or (i_v == len(count_error)-2):
+                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
 
                 else:
-                    # Weights are not applied to the last layer
-                    if (i_v == len(count_error)-1) or (i_v == len(count_error)-2):
-                        v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]) * wt, dim=-1)).detach()
 
-                    else:
-                        v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]) * wt, dim=-1)).detach()
-                
             count_error[i_v] += (v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == torch.sign(stack_grad[i_v])).int().detach()
 
         else:
@@ -272,7 +285,7 @@ def test_model(global_model, test_loader, accuracy, test_loss, args, r, train_ba
 
 
 
-def signSGD_FV(args, train_batch_size):
+def signSGD_FD(args, train_batch_size):
     # randomseed = np.linspace(0, int(20 * (args.num_it - 1)), num=args.num_it)
     randomseed = np.random.randint(1000, size=args.num_it)
 
