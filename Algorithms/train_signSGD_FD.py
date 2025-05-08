@@ -163,11 +163,30 @@ def train_clients(args, global_model, stack_grad, dataloader, train_loader, devi
         total_loss += (train_loss / args.num_workers).item()
 
         for i_v, v in enumerate(global_model.parameters()):
-            stack_grad[i_v][..., i] = v.grad.detach()
+            stack_grad[i_v][..., i] = torch.sign(v.grad).detach()
+
+            if i in args.attacked_workers:
+                stack_grad[i_v][..., i] = attack(args, stack_grad[i_v][..., i])
 
             v.grad = None
     
     return stack_grad, dataloader, train_loader, total_loss
+
+
+
+def attack(args, gradient):
+    if args.attack_method == 'det':
+        mod_gradient = -gradient
+    elif args.attack_method == 'sto':
+        mod_gradient = (2 * (torch.rand(gradient.size()) < 0.5).int() - 1) * gradient
+    elif args.attack_method == 'gauss':
+        mod_gradient = torch.randn_like(gradient) * 1
+    elif args.attack_method == 'lie':
+        mod_gradient += torch.randn_like(gradient) * 0.01
+    else:
+        raise NotImplementedError('Invalid input argument: attack_method')
+
+    return mod_gradient
 
 
 
@@ -179,9 +198,7 @@ def train_global(args, global_model, global_opt, stack_grad, r, count_error, dev
         v.grad = None
         
         if args.learning_method == 'MV':
-            v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
-            # Distributed SGD
-            # v.grad = (torch.sum(stack_grad[i_v], dim=-1) / args.num_workers).detach()
+            v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
 
         elif args.learning_method == 'FD':
             if r == 0:
@@ -191,7 +208,7 @@ def train_global(args, global_model, global_opt, stack_grad, r, count_error, dev
                 total_comp = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
 
                 if i_v == 0:
-                    total_error = torch.zeros(args.num_workers)
+                    total_error = torch.zeros(args.num_workers).to(device)
                     for i in range(args.num_workers):
                         for j in range(len(count_error)):
                             total_error[i] += torch.sum(count_error[j][..., i])
@@ -206,17 +223,17 @@ def train_global(args, global_model, global_opt, stack_grad, r, count_error, dev
 
             if (args.dataset == '20Newsgroups' or args.dataset == 'AGNews') and (i_v == 0):
                 # Weights are not applied to the embedding layers
-                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
 
             else:
                 # Weights are not applied to the last layer
                 if (i_v == len(count_error)-1) or (i_v == len(count_error)-2):
-                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]), dim=-1)).detach()
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
 
                 else:
-                    v.grad = torch.sign(torch.sum(torch.sign(stack_grad[i_v]) * wt, dim=-1)).detach()
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v] * wt, dim=-1)).detach()
 
-            count_error[i_v] += (v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == torch.sign(stack_grad[i_v])).int().detach()
+            count_error[i_v] += (v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == stack_grad[i_v]).int().detach()
 
         else:
             raise NotImplementedError('Invalid input argument: learning_method')
@@ -226,7 +243,7 @@ def train_global(args, global_model, global_opt, stack_grad, r, count_error, dev
     return global_model, global_opt, count_error
     
 
-def test_model(global_model, test_loader, accuracy, test_loss, args, r, train_batch_size, device):
+def test_model(global_model, test_loader, accuracy, test_loss, args, r, device):
     global_model.eval()
     test_lss = 0
     correct = 0
@@ -342,17 +359,17 @@ def signSGD_FD(args, train_batch_size):
                 train_loss[int(r / args.test_round)] += train_lss / 10
                 print('# of workers : ', args.num_workers, ', batch mode : ', train_batch_size, ' ------------------------- \n')
                 print(r + 1, '-th round train loss', train_lss)
-                accuracy, test_loss = test_model(global_model, test_loader, accuracy, test_loss, args, r, train_batch_size, device)
+                accuracy, test_loss = test_model(global_model, test_loader, accuracy, test_loss, args, r, device)
 
-                # results = {'args': args,
-                #            'acc': accuracy, 
-                #            'train_loss': train_loss, 
-                #            'test_loss': test_loss, 
-                #            'params': global_model.state_dict(), 
-                #            'count_error': count_error
-                #            }
-                # torch.save(results, './Results/num_workers_'+str(args.num_workers)+'/train_batch_size_'+str(train_batch_size)
-                #            +'/'+str(args.dataset)+'_'+str(args.learning_method)+'_T_'+str(args.T_in)+'_'+str(args.lr)+'.pth')
+                results = {'args': args,
+                           'acc': accuracy, 
+                           'train_loss': train_loss, 
+                           'test_loss': test_loss, 
+                           'params': global_model.state_dict(), 
+                           'count_error': count_error
+                           }
+                torch.save(results, './Results/num_workers_'+str(args.num_workers)+'/train_batch_size_'+str(train_batch_size)
+                           +'/'+str(args.dataset)+'_'+str(args.learning_method)+'_T_'+str(args.T_in)+'_'+str(args.lr)+'.pth')
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
