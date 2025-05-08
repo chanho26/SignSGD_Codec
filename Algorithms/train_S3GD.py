@@ -1,11 +1,17 @@
 import numpy as np
 import torch
 import torch.optim as optim
-import matplotlib.pyplot as plt
-import copy
+import time
+import os
+# import torchvision.models as torchmodel
+from torchvision import transforms
+from PIL import Image
 
-from Algorithms.utility import data_next, loader
+
+from Algorithms.utility import data_next, loader, loader_text_AGNEWS
 import Algorithms.model as model
+import Algorithms.model_big as model_big
+
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -18,135 +24,181 @@ criterion = torch.nn.CrossEntropyLoss()
 eps = 10 ** -5
 
 
-def initial(args):
+def initial(args, device, vocab=None):
     # Neural network
     if args.dataset == 'MNIST':
         global_model = model.Net()
+
     elif args.dataset == 'CIFAR10':
         global_model = model.ResNet56()
+
+    elif args.dataset == 'CIFAR100':
+        global_model = model.ResNet56_CIFAR100()
+
+    elif args.dataset == 'ImageNet':
+        global_model = model_big.ResNet18(num_classes=100)
+        # global_model = model.ResNet56_ImageNet()
+        # global_model = model.ResNet110_ImageNet()
+
+    elif args.dataset == '20Newsgroups':
+        embed_dim = 128
+        num_heads = 8
+        num_layers = 4
+        num_classes = 20
+        
+        if vocab:
+            vocab_size = len(vocab)
+            global_model = model_big.TransformerClassifier(vocab_size, embed_dim, num_heads, num_classes, num_layers)
+        
+        # global_model = model.TextClassifier_20News(vocab_size, embed_dim, num_classes)
+
+    elif args.dataset == 'AGNews':
+        vocab_size = len(vocab)
+        embed_dim = 64
+        hidden_dim = 128
+        num_classes = 4
+        num_heads = 8
+        num_layers = 4
+        global_model = model.TextClassificationModel(vocab_size, embed_dim, num_classes)
+        # global_model = model.TextClassifier(vocab_size, embed_dim, hidden_dim, num_classes)
+        # global_model = model_big.TransformerClassifier(vocab_size, embed_dim, num_heads, num_classes, num_layers)
+
     else:
         raise NotImplementedError('Invalid: neural network')
     
-    client_models = [copy.deepcopy(global_model) for _ in range(args.num_workers)]
+    global_model = global_model.to(device)
+
+    for i_v, v in enumerate(global_model.named_parameters()):
+        print(i_v, v[0], v[1].shape)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    num = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
+    print('Model parameters: ', num)
+    
 
     global_opt = optim.SGD(global_model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
-    client_opts = [optim.SGD(tmp_model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
-                   for tmp_model in client_models]
+
+
+    stack_grad = []
+    for _, v in enumerate(global_model.parameters()):
+        shape_grad = v.shape + (args.num_workers,)
+        stack_grad.append(torch.zeros(shape_grad).to(device))
+
+
+    if args.learning_method == 'FV' or 'FD':
+        count_error = []
+        total_count = []
+        for _, v in enumerate(global_model.parameters()):
+            shape_weight = v.shape + (args.num_workers,)
+            count_error.append(torch.zeros(shape_weight, dtype=torch.int16).to(device))
+            total_count.append(torch.zeros(shape_weight, dtype=torch.int16).to(device))
+
+    elif args.learning_method == 'MV':
+        count_error = None
+        total_count = None
+
+    else:
+        raise NotImplementedError('Invalid input argument: learning_method')
     
-    # Zeros of neural network model
-    tmp = []
-    for i_v, v in enumerate(global_model.parameters()):
-        tmp.append(torch.zeros_like(v))
+
+    if args.sparsity != 1:
+        accum_grad = []
+        for _, v in enumerate(global_model.parameters()):
+            shape_grad = v.shape + (args.num_workers,)
+            accum_grad.append(torch.zeros(shape_grad).to(device))
+    else:
+        accum_grad = None
 
     
-    count_error = []
-    total_count = []
-    for i_v in range(len(tmp)):
-        shape_layer = tmp[i_v].shape + (args.num_workers,)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-        # Count the number of errors 
-        count_error.append(torch.zeros(shape_layer))
-
-        # Total counts that each worker sends the gradient coordinate
-        total_count.append(torch.zeros(shape_layer))
-
-    # Top-K error accumulation
-    accum_grad = []
-    for i in range(args.num_workers):
-        accum_grad.append(copy.deepcopy(tmp))
-
-    return global_model, client_models, global_opt, client_opts, tmp, count_error, total_count, accum_grad
+    return global_model, global_opt, stack_grad, accum_grad, count_error, total_count
+  
 
 
-def transition_unit(global_model, client_models, device, num_workers):
-    global_model = global_model.to(device)
-    for i in range(num_workers):
-            client_models[i] = client_models[i].to(device)
-
-    return global_model, client_models
-        
-
-
-def train_clients(args, client_models, client_opts, dataloader, train_loader):
+def train_clients(args, global_model, stack_grad, accum_grad, dataloader, train_loader, device):
     # No optim.step()
+    total_loss = 0       
+
     for i in range(args.num_workers):
-        client_models[i].train()
-        (idx, (data, target)), dataloader[i] = data_next(dataloader[i], train_loader[i])
-        data, target = data.to(device), target.to(device)
-        client_opts[i].zero_grad()
-        output = client_models[i](data)
+        global_model.train()
 
-        train_loss = criterion(output, target)
-        train_loss.backward()
-    
-    return client_models, client_opts, dataloader, train_loader
+        for _, v in enumerate(global_model.parameters()):
+            v.grad = None 
 
+        if args.dataset == 'ImageNet':
+            transform_train = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
-# Set the weight to 1 if the worker sent signs to the server less than T_in times for a certain gradient coordinate
+            (_, (name, target)), dataloader[i] = data_next(dataloader[i], train_loader[i])
+            train_folder_dir = './data/ImageNet/train'
+            folders_name = os.listdir(train_folder_dir)
+            batch_train_folder_dir = [train_folder_dir] * len(folders_name)
+            batch_folders_name = [folders_name[target[f].item()] for f in range(len(name))]
+            batch_file_name = [os.path.join(batch_train_folder_dir[f], batch_folders_name[f], name[f]) for f in range(len(name))]
 
-def calc_weight_S3GD_FV(args, r, count_error, total_count):
-    weight = []
-    if r == 0:
-        for i_v in range(len(count_error)):
-            weight.append(torch.ones_like(count_error[i_v]))
-    else:
-        for i_v in range(len(count_error)):
-            prob_right = count_error[i_v] / (total_count[i_v] + eps)
+            images = [transform_train(Image.open(img_path).convert("RGB")) for img_path in batch_file_name]
+            time.sleep(0.1)
+            data = torch.stack(images)
 
-            tmp_weight = torch.log((prob_right + eps) / (1 - prob_right + eps))
-            tmp_weight = torch.sign(tmp_weight) * torch.minimum(torch.abs(tmp_weight), args.max_LLR * torch.ones_like(tmp_weight))
-            tmp_weight *= (total_count[i_v] >= args.T_in).float() * tmp_weight
-            tmp_weight += (total_count[i_v] < args.T_in).float() * 0.1
+            data, target = data.to(device), target.to(device)
+            output = global_model(data)
+            train_loss = criterion(output, target)
 
-            weight.append(tmp_weight)
-    
-    return weight
+        elif args.dataset == '20Newsgroups' or args.dataset == 'AGNews':
+            (_, (texts, labels, lengths)), dataloader[i] = data_next(dataloader[i], train_loader[i])
+            texts, labels, lengths = texts.to(device), labels.to(device), lengths.to(device)
+            time.sleep(0.1)
+            output = global_model(texts, lengths)
+            train_loss = criterion(output, labels)
 
+        else:
+            (_, (data, target)), dataloader[i] = data_next(dataloader[i], train_loader[i])
+            data, target = data.to(device), target.to(device)
+            output = global_model(data)
+            train_loss = criterion(output, target)
 
-
-def calc_weight_S3GD_FD(args, r, count_error, total_count):
-    weight = []
-    if r == 0:
-        for i_v in range(len(count_error)):
-            weight.append(torch.ones_like(count_error[i_v]))
-
-    elif r < args.T_in:
-        total_comp_all_worker = 0
-        for i_v in range(len(total_count)):
-            total_comp_all_worker += torch.sum(total_count[i_v])
-
-        prob_right = torch.zeros(args.num_workers)
-        for i in range(args.num_workers):
-            total_error = 0
-            for i_v in range(len(count_error)):
-                total_error += torch.sum(count_error[i_v][..., i])
-            
-            prob_right[i] = total_error / total_comp_all_worker * args.num_workers
-
-        weight_worker = torch.log((prob_right + eps) / (1 - prob_right + eps))
-        # weight_worker = torch.maximum(weight_worker, torch.zeros_like(weight_worker))
-        weight_worker = torch.sign(weight_worker) * torch.minimum(torch.abs(weight_worker), args.max_LLR * torch.ones_like(weight_worker))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         
-        for i_v in range(len(count_error)):
-            tmp_weight = torch.ones(count_error[i_v].shape)
-            tmp_weight = tmp_weight * weight_worker
+        train_loss.backward()
 
-            weight.append(tmp_weight)
-            
-    else:
-        for i_v in range(len(count_error)):
-            prob_right = count_error[i_v] / (total_count[i_v] + eps)
+        total_loss += (train_loss / args.num_workers).item()
 
-            tmp_weight = torch.log((prob_right + eps) / (1 - prob_right + eps))
-            tmp_weight = torch.sign(tmp_weight) * torch.minimum(torch.abs(tmp_weight), args.max_LLR * torch.ones_like(tmp_weight))
+        if args.sparsity < 1:
+            for i_v, v in enumerate(global_model.parameters()):
+                stack_grad[i_v][..., i], accum_grad[i_v][..., i] = sparsification(args, v.grad.detach(), accum_grad[i_v][..., i], device)
+                stack_grad[i_v][..., i] = torch.sign(stack_grad[i_v][..., i])
 
-            weight.append(tmp_weight)
+                if i in args.attacked_workers:
+                    stack_grad[i_v][..., i] = attack(args, stack_grad[i_v][..., i])
+
+                v.grad = None
+
+        elif args.sparsity == 1:
+            for i_v, v in enumerate(global_model.parameters()):
+                stack_grad[i_v][..., i] = torch.sign(v.grad).detach()
+
+                if i in args.attacked_workers:
+                    stack_grad[i_v][..., i] = attack(args, stack_grad[i_v][..., i])
+
+                v.grad = None
+
+        else:
+            raise NotImplementedError('Invalid input argument: sparsity')
     
-    return weight
+    return stack_grad, accum_grad, dataloader, train_loader, total_loss
 
 
 
-def sparsification(args, gradient, accum_grad):
+def sparsification(args, gradient, accum_grad, device):
     if args.spar_method == 'top':
         accum_grad *= args.accum_weight # no accumulation -> 0
         accum_grad += gradient
@@ -154,10 +206,11 @@ def sparsification(args, gradient, accum_grad):
         num_gradient = torch.numel(flatten)
         num_select = int(np.ceil(num_gradient * args.sparsity))
         _, index_select = torch.topk(abs(flatten), num_select)
+        index_select = index_select.to(device)
 
         # threshold = abs(flatten[index_select[-1]])
 
-        spar_gradient = torch.zeros(flatten.shape)
+        spar_gradient = torch.zeros(flatten.shape).to(device)
         spar_gradient[index_select] = flatten[index_select]
         flatten[index_select] = 0
         accum_grad = torch.reshape(flatten, gradient.shape)
@@ -174,152 +227,160 @@ def sparsification(args, gradient, accum_grad):
     return mod_gradient, accum_grad
 
 
-def pre_processing_FV(args, r, client_models, i, est_grad, weight, accum_grad):
-    for i_v, v in enumerate(client_models[i].parameters()):
+
+def attack(args, gradient):
+    if args.attack_method == 'det':
+        mod_gradient = -gradient
+    elif args.attack_method == 'sto':
+        mod_gradient = (2 * (torch.rand(gradient.size()) < 0.5).int() - 1) * gradient
+    elif args.attack_method == 'gauss':
+        mod_gradient = torch.randn_like(gradient) * 1
+    elif args.attack_method == 'lie':
+        mod_gradient += torch.randn_like(gradient) * 0.01
+    else:
+        raise NotImplementedError('Invalid input argument: attack_method')
+
+    return mod_gradient
+
+
+
+def train_global(args, global_model, global_opt, stack_grad, r, count_error, total_count, device):
+    global_model.train()
+    global_opt.zero_grad()
+
+    for i_v, v in enumerate(global_model.parameters()):
+        v.grad = None
+        
         if args.learning_method == 'MV':
-            if args.sparsity == 1:
-                est_grad[i_v] += torch.sign(v.grad)
-            else:
-                v.grad, accum_grad[i][i_v] = sparsification(args, v.grad, accum_grad[i][i_v])
-                est_grad[i_v] += torch.sign(v.grad)
+            v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
+
         elif args.learning_method == 'FV':
             if r < args.T_in:
-                if args.sparsity == 1:
-                    est_grad[i_v] += torch.sign(v.grad)
-                else:
-                    v.grad, accum_grad[i][i_v] = sparsification(args, v.grad, accum_grad[i][i_v])
-                    est_grad[i_v] += torch.sign(v.grad)
+                v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
+
             else:
-                if args.sparsity == 1:
-                    est_grad[i_v] += torch.sign(v.grad) * weight[i_v][..., i]
+                wt = torch.log(count_error[i_v] / (r - count_error[i_v]))
+                wt = torch.sign(wt) * torch.minimum(torch.abs(wt), args.num_workers * torch.ones_like(wt))
+                wt *= (total_count[i_v] >= args.T_in).float() * wt
+                wt += (total_count[i_v] < args.T_in).float() * 0.1  # Should be set
+
+                if (args.dataset == '20Newsgroups' or args.dataset == 'AGNews') and (i_v == 0):
+                    # Weights are not applied to the embedding layers
+                        v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
+
                 else:
-                    v.grad, accum_grad[i][i_v] = sparsification(args, v.grad, accum_grad[i][i_v])
-                    est_grad[i_v] += torch.sign(v.grad) * weight[i_v][..., i]
-    return est_grad, accum_grad
+                    # Weights are not applied to the last layer
+                    if (i_v == len(count_error)-1) or (i_v == len(count_error)-2):
+                        v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
+
+                    else:
+                        v.grad = torch.sign(torch.sum(stack_grad[i_v] * wt, dim=-1)).detach()
+                
+            count_error[i_v] += (v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == stack_grad[i_v]).int().detach()
 
 
-
-
-def pre_processing_FD(args, r, client_models, i, est_grad, weight, accum_grad):
-    for i_v, v in enumerate(client_models[i].parameters()):
-        if args.learning_method == 'MV':
-            if args.sparsity == 1:
-                est_grad[i_v] += torch.sign(v.grad) # v.grad 
-            else:
-                v.grad, accum_grad[i][i_v] = sparsification(args, v.grad, accum_grad[i][i_v])
-                est_grad[i_v] += torch.sign(v.grad) # v.grad  
         elif args.learning_method == 'FD':
-            if args.sparsity == 1:
-                est_grad[i_v] += torch.sign(v.grad) * weight[i_v][..., i]
+            if r == 0:
+                wt = torch.ones_like(count_error[i_v])
+
+            elif r < args.T_in:
+                if i_v == 0:
+                    total_comp_all_workers = torch.zeros(args.num_workers).to(device)
+                    total_error = torch.zeros(args.num_workers).to(device)
+                    for i in range(args.num_workers):
+                        for j in range(len(count_error)):
+                            total_error[i] += torch.sum(count_error[j][..., i])
+                            total_comp_all_workers[i] += torch.sum(total_count[j][..., i])
+
+                wt = torch.log(total_error / (total_comp_all_workers - total_error))
+                wt = torch.sign(wt) * torch.minimum(torch.abs(wt), args.num_workers * torch.ones_like(wt))
+
             else:
-                v.grad, accum_grad[i][i_v] = sparsification(args, v.grad, accum_grad[i][i_v])
-                est_grad[i_v] += torch.sign(v.grad) * weight[i_v][..., i]
+                wt = torch.log(count_error[i_v] / (total_count[i_v] - count_error[i_v]))
+                wt = torch.sign(wt) * torch.minimum(torch.abs(wt), args.num_workers * torch.ones_like(wt))
 
-    return est_grad, accum_grad
+            if (args.dataset == '20Newsgroups' or args.dataset == 'AGNews') and (i_v == 0):
+                # Weights are not applied to the embedding layers
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
 
+            else:
+                # Weights are not applied to the last layer
+                if (i_v == len(count_error)-1) or (i_v == len(count_error)-2):
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v], dim=-1)).detach()
 
+                else:
+                    v.grad = torch.sign(torch.sum(stack_grad[i_v] * wt, dim=-1)).detach()
 
-
-
-def update_count(args, client_models, count_error, total_count, est_grad):
-    for i in range(args.num_workers):
-        for i_v, v in enumerate(client_models[i].parameters()):
-            count_error[i_v][..., i] *= args.weight_exp
-            total_count[i_v][..., i] *= args.weight_exp
 
             if args.sparsity == 1:
-                total_count[i_v][..., i] += 1
-                count_error[i_v][..., i] += (est_grad[i_v] == torch.sign(v.grad))
-            else:
-                total_count[i_v][..., i] += torch.abs(torch.sign(v.grad))
-                count_error[i_v][..., i] += (est_grad[i_v] == torch.sign(v.grad)) * torch.abs(torch.sign(v.grad))
-    
-    return count_error, total_count
+                total_count[i_v] += 1
+                count_error[i_v] += (v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == stack_grad[i_v]).int().detach()
+            
+            elif args.sparsity < 1:
+                total_count[i_v] += torch.abs(stack_grad[i_v]).type(torch.int16)
+                count_error[i_v] += ((v.grad.detach().unsqueeze(-1) * torch.ones(v.shape + (args.num_workers,)).to(device) == stack_grad[i_v]).int() \
+                                     * torch.abs(stack_grad[i_v])).type(torch.int16).detach()
 
-
-def attack(args, client_model):
-    for i_v, v in enumerate(client_model.parameters()):
-        if args.attack_method == 'det':
-            v.grad = -v.grad
-        elif args.attack_method == 'sto':
-            v.grad = (2 * (torch.rand(v.size()) < 0.5).int() - 1) * v.grad
-        else:
-            continue
-    return client_model
-
-
-def grad_processing(args, client_models, tmp, r, weight, count_error, total_count, accum_grad):
-    est_grad = copy.deepcopy(tmp)
-
-    for i in range(args.num_workers):
-        # Attack
-        if sum(i == args.attacked_workers) == 1:
-            client_models[i] = attack(args, client_models[i])
-        
-        # Gradient processing
-        if args.learning_method == 'FV':
-            est_grad, accum_grad = pre_processing_FV(args, r, client_models, i, est_grad, weight, accum_grad)
-        elif args.learning_method == 'FD' or 'MV':
-            est_grad, accum_grad = pre_processing_FD(args, r, client_models, i, est_grad, weight, accum_grad)
         else:
             raise NotImplementedError('Invalid input argument: learning_method')
 
-    # Majority vote (MV)
-    for i_v in range(len(est_grad)):
-        est_grad[i_v] = torch.sign(est_grad[i_v]) # est_grad[i_v] / args.num_workers
-
-    # Count error
-    count_error, total_count = update_count(args, client_models, count_error, total_count, est_grad)
-    
-    return est_grad, count_error, total_count, accum_grad
-
-
-def train_global(global_model, global_opt, tmp, est_grad):
-    global_model.train()
-            
-    for i_v, v in enumerate(global_model.parameters()):
-        v.grad = torch.zeros_like(tmp[i_v])
-        v.grad = est_grad[i_v]
-
-    global_model = global_model.to(device)
-
     global_opt.step()
 
-    return global_model, global_opt
-
-
-def distribute(global_model, client_models, args):
-    ttmp = []
-    for i_v, v in enumerate(global_model.parameters()):
-        ttmp.append(v)
-
-    for i in range(args.num_workers):
-        for i_v, v in enumerate(client_models[i].parameters()):
-            v.data = ttmp[i_v]
-
-    return client_models
+    return global_model, global_opt, count_error, total_count
     
 
-def test_model(global_model, test_loader, accuracy, args, r):
+def test_model(global_model, test_loader, accuracy, test_loss, args, r, device):
     global_model.eval()
-    test_loss = 0
+    test_lss = 0
     correct = 0
 
     iter_num = 0
-    
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = global_model(data)
-            test_loss += criterion(output, target).item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-            iter_num += 1
 
-    test_loss /= iter_num
-    accuracy[int((r + 1) / args.test_round)] += correct / (args.num_it * len(test_loader.dataset))
-    print('# of workers : ', args.num_workers, ', Attacked worker : ', args.attacked_workers, ' ------------------------- \n')
-    print(r + 1, '-th round test loss', test_loss)
+    with torch.no_grad():
+        if args.dataset == '20Newsgroups' or args.dataset == 'AGNews':
+            for texts, labels, lengths in test_loader:
+                texts, labels, lengths = texts.to(device), labels.to(device), lengths.to(device)
+                time.sleep(0.1)
+                output = global_model(texts, lengths)
+                test_lss += criterion(output, labels).item()
+                pred = output.argmax(dim=1, keepdim=True)
+                correct += pred.eq(labels.view_as(pred)).sum().item()
+                iter_num += 1
+        
+        else:
+            for data, target in test_loader:
+                if args.dataset == 'ImageNet':
+                    transform_test = transforms.Compose([
+                        transforms.Resize(256),
+                        transforms.CenterCrop(224),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                    ])
+
+                    test_folder_dir = './data/ImageNet/val'
+                    folders_name = os.listdir(test_folder_dir)
+                    batch_test_folder_dir = [test_folder_dir] * len(folders_name)
+                    batch_folders_name = [folders_name[target[f].item()] for f in range(len(data))]
+                    batch_file_name = [os.path.join(batch_test_folder_dir[f], batch_folders_name[f], data[f]) for f in range(len(data))]
+
+                    images = [transform_test(Image.open(img_path).convert("RGB")) for img_path in batch_file_name]
+                    time.sleep(0.1)
+                    data = torch.stack(images)
+
+                data, target = data.to(device), target.to(device)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                output = global_model(data)
+                test_lss += criterion(output, target).item()
+                pred = output.argmax(dim=1, keepdim=True)
+                correct += pred.eq(target.view_as(pred)).sum().item()
+                iter_num += 1
+
+    test_lss /= iter_num
+    accuracy[int((r + 1) / args.test_round)] += correct / (10 * len(test_loader.dataset))
+    test_loss[int(r / args.test_round)] += test_lss / 10
+    print(r + 1, '-th round test loss', test_lss)
     print(r + 1, '-th round test accuracy', correct / len(test_loader.dataset))
     print('\n')
 
@@ -327,42 +388,77 @@ def test_model(global_model, test_loader, accuracy, args, r):
 
 
 
-def S3GD_FV(args):
+def S3GD_FV(args, train_batch_size):
     # randomseed = np.linspace(0, int(20 * (args.num_it - 1)), num=args.num_it)
     randomseed = np.random.randint(1000, size=args.num_it)
 
     accuracy = torch.zeros(int(args.num_round / args.test_round) + 1).to(device)
+    train_loss = torch.zeros(int(args.num_round / args.test_round) + 1).to(device)
+    test_loss = torch.zeros(int(args.num_round / args.test_round) + 1).to(device)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    num_stop = 0
+
+#################################################################################################################
+    # If you need to load any pre-trained model (training is forced to stop):
+    # tmp = torch.load('./Results/num_workers_15/train_batch_size_1/AGNews_FV_T_30_0.001.pth', weights_only=False)
+
+    # accuracy = tmp['acc']
+    # train_loss = tmp['train_loss']
+    # test_loss = tmp['test_loss']
+
+    # num_stop = (torch.count_nonzero(accuracy) - 1) * args.test_round + 1
+#################################################################################################################
 
     for it in range(args.num_it):
+        print('Iteration: ', int(it+1))
         torch.manual_seed(randomseed[it])
 
-        dataloader, train_loader, test_loader = loader(args)
+        if args.dataset == '20Newsgroups':
+            dataloader, train_loader, test_loader, vocab = loader_text(args)
+            global_model, global_opt, stack_grad, accum_grad, count_error, total_count = initial(args, device, vocab)
 
-        global_model, client_models, global_opt, client_opts, tmp, count_error, total_count, accum_grad = initial(args)
+        elif args.dataset == 'AGNews':
+            dataloader, train_loader, test_loader, vocab = loader_text_AGNEWS(args)
+            global_model, global_opt, stack_grad, accum_grad, count_error, total_count = initial(args, device, vocab)
 
-        global_model, client_models = transition_unit(global_model, client_models, device, args.num_workers)
+        else:
+            dataloader, train_loader, test_loader = loader(args)
+            global_model, global_opt, stack_grad, accum_grad, count_error, total_count = initial(args, device)
 
-        for r in range(args.num_round):
-            global_model, client_models = transition_unit(global_model, client_models, device, args.num_workers)
+#################################################################################################################
+        # If you need to load any pre-trained model (training is forced to stop):
+        # global_model.load_state_dict(tmp['params'])
+        # count_error = tmp['count_error']
+#################################################################################################################
 
-            client_models, client_opts, dataloader, train_loader = train_clients(args, client_models, client_opts, dataloader, train_loader)
+        for r in range(int(num_stop), args.num_round, 1):
+            if r % 10 == 0:
+                print('Training round: ', r)
 
-            global_model, client_models = transition_unit(global_model, client_models, torch.device('cpu'), args.num_workers)
+            stack_grad, accum_grad, dataloader, train_loader, train_lss = train_clients(args, global_model, stack_grad, accum_grad, dataloader, train_loader, device)
 
-            if args.learning_method == 'FV' or 'MV':
-                weight = calc_weight_S3GD_FV(args, r, count_error, total_count)
-            elif args.learning_method == 'FD':
-                weight = calc_weight_S3GD_FD(args, r, count_error, total_count)
-            else:
-                raise NotImplementedError('Invalid input argument: learning_method')
-
-            est_grad, count_error, total_count, accum_grad = grad_processing(args, client_models, tmp, r, weight, count_error, total_count, accum_grad)
-
-            global_model, global_opt = train_global(global_model, global_opt, tmp, est_grad)
-
-            client_models = distribute(global_model, client_models, args)
+            global_model, global_opt, count_error, total_count = train_global(args, global_model, global_opt, stack_grad, r, count_error, total_count, device)
 
             if r % args.test_round == 0:
-                accuracy, test_loss = test_model(global_model, test_loader, accuracy, args, r)
+                train_loss[int(r / args.test_round)] += train_lss / 10
+                print('# of workers : ', args.num_workers, ', batch mode : ', train_batch_size, ' ------------------------- \n')
+                print(r + 1, '-th round train loss', train_lss)
+                accuracy, test_loss = test_model(global_model, test_loader, accuracy, test_loss, args, r, device)
 
-    return accuracy, test_loss
+                results = {'args': args,
+                           'acc': accuracy, 
+                           'train_loss': train_loss, 
+                           'test_loss': test_loss, 
+                           'params': global_model.state_dict(), 
+                           'count_error': count_error,
+                           'total_count': total_count
+                           }
+                torch.save(results, './Results/num_workers_'+str(args.num_workers)+'/train_batch_size_'+str(train_batch_size)
+                           +'/'+str(args.dataset)+'_'+str(args.learning_method)+'_T_'+str(args.T_in)+'_'+str(args.lr)+'.pth')
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return accuracy, train_loss, test_loss
